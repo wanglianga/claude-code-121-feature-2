@@ -47,7 +47,11 @@ class DeliveryService(
 
     fun telemetry(orderId: String, riderId: String, req: TelemetryRequest): TelemetryReading {
         val o = orders.require(orderId)
-        orderService.requireStatus(o, OrderStatus.DELIVERING, OrderStatus.DELIVERY_EXCEPTION)
+        orderService.requireStatus(
+            o,
+            OrderStatus.DELIVERING, OrderStatus.DELIVERY_EXCEPTION,
+            OrderStatus.SIGN_FAILED, OrderStatus.RESCHEDULED
+        )
         if (o.riderId != riderId) throw ForbiddenException("该订单由骑手 ${o.riderId} 配送，$riderId 无权上报")
 
         val reading = TelemetryReading(
@@ -93,24 +97,15 @@ class DeliveryService(
         return reading
     }
 
-    fun deliveryAttempt(orderId: String, riderId: String, req: DeliveryAttemptRequest): ColdChainOrder {
+    fun deliveryAttempt(orderId: String, riderId: String, req: DeliveryAttemptRequest): Any {
         val o = orders.require(orderId)
-        orderService.requireStatus(o, OrderStatus.DELIVERING, OrderStatus.DELIVERY_EXCEPTION)
         if (o.riderId != riderId) throw ForbiddenException("该订单由骑手 ${o.riderId} 配送，$riderId 无权操作")
         when (req.result) {
-            "PATIENT_NOT_HOME" -> {
-                o.status = OrderStatus.SIGN_FAILED
-                o.usability = Usability.PENDING_REJUDGMENT
-                o.lastDeliveryStatus = "PATIENT_NOT_HOME"
-                orderService.save(o)
-                incidents.report(
-                    orderId, IncidentType.PATIENT_NOT_HOME, Role.RIDER, riderId,
-                    "患者不在家，签收失败，冷藏药品已在途等待药师判断"
-                )
-            }
-            else -> throw BadRequestException("不支持的配送结果: ${req.result}（目前支持 PATIENT_NOT_HOME）")
+            "PATIENT_NOT_HOME" -> throw BadRequestException(
+                "患者不在家请改用 POST /api/orders/{id}/not-home/arrive 登记等待时间、电话结果与冷藏代收点情况"
+            )
+            else -> throw BadRequestException("不支持的配送结果: ${req.result}")
         }
-        return o
     }
 
     fun telemetryList(orderId: String): List<TelemetryReading> =

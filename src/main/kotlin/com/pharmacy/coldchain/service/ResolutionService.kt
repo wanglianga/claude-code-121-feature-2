@@ -26,7 +26,8 @@ class ResolutionService(
     private val store: JsonStore,
     private val incidents: IncidentService,
     private val payments: PaymentService,
-    private val orderService: OrderService
+    private val orderService: OrderService,
+    private val notHome: NotHomeService
 ) {
 
     /** 根据未处理的异常事件自动推导处理建议 */
@@ -132,6 +133,7 @@ class ResolutionService(
 
         o.status = if (req.reissue) OrderStatus.REISSUED else OrderStatus.CLOSED
         orderService.save(o)
+        notHome.closeRecord(orderId)
         incidents.resolveAllForOrder(orderId, resolver, "赔付处理完成：${req.drugDisposition}")
         return resolution
     }

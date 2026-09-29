@@ -13,6 +13,8 @@ import org.springframework.stereotype.Component
  *   telemetry:{orderId}          遥测 list
  *   incident:{id} + idx:incident:order:{orderId}   异常事件
  *   rejudgment:{orderId}         药师重判 list
+ *   nothome:{orderId}            患者不在家服务记录
+ *   task:return:{id} + idx:tasks:return[/rider:{riderId}] 退回药店任务
  *   resolution:{orderId}         最终处理结果
  *   payment:{orderId}            医保自费拆分
  *   box:{boxNo} + idx:boxes      保温箱

@@ -9,6 +9,7 @@ import com.pharmacy.coldchain.domain.CreateOrderRequest
 import com.pharmacy.coldchain.domain.DrugType
 import com.pharmacy.coldchain.domain.FollowUp
 import com.pharmacy.coldchain.domain.IncidentType
+import com.pharmacy.coldchain.domain.NotHomeStage
 import com.pharmacy.coldchain.domain.OrderStatus
 import com.pharmacy.coldchain.domain.OutboundRequest
 import com.pharmacy.coldchain.domain.OverTempInfo
@@ -44,7 +45,10 @@ class OrderService(
     private val store: JsonStore,
     private val incidents: IncidentService,
     private val boxes: BoxService,
-    private val payments: PaymentService
+    private val payments: PaymentService,
+    private val notHome: NotHomeService,
+    @org.springframework.beans.factory.annotation.Value("\${coldchain.box.min-rated-minutes:120}")
+    private val minRatedMinutes: Int = 120
 ) {
 
     // ---------- 下单 ----------
@@ -167,11 +171,15 @@ class OrderService(
         box.history.add(o.id)
         boxes.save(box)
 
+        // 保温箱额定保温时长：出库时确定安全截止时刻，患者不在家改约时据此重算
+        val ratedMinutes = NotHomeService.ratedMinutes(req.icePackCount, req.boxRatedMinutes, minRatedMinutes)
         o.batchNo = req.batchNo
         o.expiryDate = req.expiryDate
         o.boxNo = req.boxNo
         o.icePackCount = req.icePackCount
         o.outboundTempC = req.outboundTempC
+        o.boxRatedMinutes = ratedMinutes
+        o.boxSafeUntil = now + ratedMinutes * 60_000L
         o.estimatedDeliveryAt = now + req.etaMinutes * 60_000
         o.outboundAt = now
         o.warehouseOperator = operator
@@ -187,6 +195,13 @@ class OrderService(
         if (o.usability != Usability.PENDING_REJUDGMENT) {
             throw ConflictException("订单 ${o.id} 当前不需要药师重新判断（usability=${o.usability}）")
         }
+        // 药品退回药店后，药师须先确认退回箱温，才能重新评估温控
+        if (o.status == OrderStatus.RETURNED_TO_PHARMACY) {
+            val rec = notHome.findRecord(orderId)
+            if (rec?.returnTempConfirmedAt == null) {
+                throw ConflictException("请先确认退回箱温，再重新评估温控（药品是否仍可使用）")
+            }
+        }
         val rec = Rejudgment(
             id = store.nextId("RJ"),
             orderId = orderId,
@@ -200,18 +215,43 @@ class OrderService(
         if (req.usable) {
             o.usability = Usability.USABLE
             when (o.status) {
-                // 配送异常/签收失败 → 药品仍可用，继续配送
-                OrderStatus.DELIVERY_EXCEPTION, OrderStatus.SIGN_FAILED -> {
+                // 配送异常（超温/开盖/破损）→ 药品仍可用，继续配送
+                OrderStatus.DELIVERY_EXCEPTION -> {
                     o.status = OrderStatus.DELIVERING
                     incidents.resolveAllForOrder(orderId, pharmacist, "药师重新判断：药品可继续使用，恢复配送")
                 }
                 // 退药申请中药品仍可用 → 仍需客服/赔付处理退药诉求
                 OrderStatus.RETURN_REQUESTED -> o.status = OrderStatus.AWAITING_RESOLUTION
+                // 患者不在家退回药店：温控重新评估通过，释放保温箱，药品重新出库再派送
+                OrderStatus.RETURNED_TO_PHARMACY -> {
+                    val rec = notHome.findRecord(orderId)
+                    o.boxNo?.let { boxes.find(it) }?.let { b ->
+                        b.status = BoxStatus.READY
+                        b.currentOrderId = null
+                        boxes.save(b)
+                    }
+                    o.boxNo = null
+                    o.boxSafeUntil = null
+                    o.boxDurationResetAt = null
+                    o.boxRemainingMinutesAtReset = null
+                    o.status = OrderStatus.READY_FOR_OUTBOUND
+                    o.usability = Usability.NOT_OUTBOUND
+                    notHome.markRejudged(orderId)
+                    incidents.resolveAllForOrder(orderId, pharmacist,
+                        "药师确认退回箱温 ${rec?.returnBoxTempC}°C 并判定温控合格，药品重新出库")
+                }
+                // 患者不在家签收失败阶段不能直接重判恢复配送，必须先走改约/退回流程
+                OrderStatus.SIGN_FAILED -> throw ConflictException(
+                    "患者不在家订单不能直接重新判断恢复配送：安全时限内请登记药师意见并由患者改约，" +
+                        "超过安全时限须生成退回药店任务带回后重新评估温控"
+                )
                 else -> {}
             }
         } else {
+            val wasReturned = o.status == OrderStatus.RETURNED_TO_PHARMACY
             o.usability = Usability.UNUSABLE_SCRAPPED
             o.status = OrderStatus.AWAITING_RESOLUTION
+            if (wasReturned) notHome.markRejudged(orderId)
             incidents.report(
                 orderId, IncidentType.PHARMACIST_UNUSABLE, Role.PHARMACIST, pharmacist,
                 "药师判定药品不可继续使用: ${req.comment}"
@@ -263,8 +303,9 @@ class OrderService(
         )
         o.status = OrderStatus.SIGNED
         save(o)
-        // 顺利签收后，关闭配送途中遗留的已处理异常
+        // 顺利签收后，关闭配送途中遗留的已处理异常与患者不在家服务记录
         incidents.resolveAllForOrder(orderId, patientId, "订单已签收")
+        notHome.closeRecord(orderId)
         return o
     }
 
@@ -310,7 +351,9 @@ class OrderService(
             resolution = store.get<Resolution>("resolution:$orderId"),
             payment = payments.get(orderId),
             box = o.boxNo?.let { boxes.find(it) },
-            followUps = store.lrangeJson("followup:$orderId")
+            followUps = store.lrangeJson("followup:$orderId"),
+            notHome = notHome.findRecord(orderId),
+            returnTask = notHome.findTaskByOrder(orderId)
         )
     }
 
@@ -321,6 +364,7 @@ class OrderService(
         val payment = payments.get(orderId)
         val telemetry = store.lrangeJson<TelemetryReading>("telemetry:$orderId")
         val reissued = o.reissuedOrderId?.let { orders.find(it) }
+        val nh = notHome.findRecord(orderId)
         return PatientOrderView(
             orderId = o.id,
             status = o.status,
@@ -344,7 +388,10 @@ class OrderService(
             medicationReminders = o.medicationReminders,
             riskReminders = o.riskReminders,
             sign = o.signOff,
-            estimatedDeliveryAt = o.estimatedDeliveryAt
+            estimatedDeliveryAt = o.estimatedDeliveryAt,
+            notHomeStage = nh?.takeIf { it.stage != NotHomeStage.CLOSED }?.stage,
+            rescheduleEtaMinutes = nh?.rescheduleEtaMinutes,
+            boxSafeUntil = o.boxSafeUntil
         )
     }
 

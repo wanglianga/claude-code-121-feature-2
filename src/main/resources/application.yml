@@ -11,6 +11,12 @@ spring:
       database: ${REDIS_DB:0}
       timeout: 3s
 
+# 冷链保温箱温控参数
+coldchain:
+  box:
+    # 出库未显式指定 boxRatedMinutes 时的额定保温时长下限（分钟）
+    min-rated-minutes: ${BOX_MIN_RATED_MINUTES:120}
+
 logging:
   level:
     root: info

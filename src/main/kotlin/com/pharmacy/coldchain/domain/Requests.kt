@@ -24,7 +24,9 @@ data class OutboundRequest(
     val boxNo: String,
     val icePackCount: Int,
     val outboundTempC: Double,
-    val etaMinutes: Long
+    val etaMinutes: Long,
+    /** 保温箱额定保温时长（分钟），不传时按冰袋数量默认：每袋 60 分钟，至少 120 分钟 */
+    val boxRatedMinutes: Int? = null
 )
 
 data class TelemetryRequest(
@@ -38,6 +40,44 @@ data class TelemetryRequest(
 
 data class DeliveryAttemptRequest(
     val result: String   // 目前支持 PATIENT_NOT_HOME
+)
+
+/** 骑手到达患者家无人签收：登记服务记录 */
+data class NotHomeArrivalRequest(
+    val waitedMinutes: Int,                       // 门口等待时长（分钟）
+    val phoneResult: PhoneResult,                 // 电话结果
+    val phoneNote: String? = null,
+    val coolPoint: CoolPointAvailability,         // 是否可放置冷藏代收点
+    val coolPointNote: String? = null
+)
+
+/** 药师对患者不在家订单的处置意见 */
+data class NotHomePharmacistDecisionRequest(
+    val opinion: PharmacistOpinion,   // WAIT_AND_RESCHEDULE / BRING_BACK
+    val comment: String? = null
+)
+
+/** 患者同意改约签收：重新计算保温箱可用时长 */
+data class RescheduleRequest(
+    val etaMinutes: Int,               // 改约后预计再派送在途时长（分钟）
+    val note: String? = null
+)
+
+/** 骑手把药品带回药店（药师要求后方可操作） */
+data class BringBackRequest(
+    val boxTempC: Double,              // 骑手交接时上报的箱内温度
+    val note: String? = null
+)
+
+/** 药师确认退回箱温（重新评估温控的前提） */
+data class ReturnTempConfirmRequest(
+    val boxTempC: Double,
+    val comment: String? = null
+)
+
+/** 药店接收退回药品 */
+data class ReturnTaskReceiveRequest(
+    val note: String? = null
 )
 
 data class SignRequest(
@@ -119,7 +159,9 @@ data class PharmacyOrderView(
     val resolution: Resolution?,
     val payment: PaymentSplit?,
     val box: ColdChainBox?,
-    val followUps: List<FollowUp>
+    val followUps: List<FollowUp>,
+    val notHome: NotHomeServiceRecord? = null,   // 患者不在家服务记录
+    val returnTask: ReturnTask? = null           // 退回药店任务
 )
 
 data class OverTempInfo(
@@ -152,7 +194,10 @@ data class PatientOrderView(
     val medicationReminders: List<String>,
     val riskReminders: List<String>,
     val sign: SignOff?,
-    val estimatedDeliveryAt: Long?
+    val estimatedDeliveryAt: Long?,
+    val notHomeStage: NotHomeStage? = null,           // 不在家处理阶段（改约/退回进度）
+    val rescheduleEtaMinutes: Int? = null,
+    val boxSafeUntil: Long? = null
 )
 
 /** 赔付处理建议（根据异常事件自动推导） */

@@ -43,6 +43,12 @@ data class ColdChainOrder(
     var overTemp: Boolean = false,
     var lastDeliveryStatus: String? = null,
 
+    // 保温箱温控安全时限：出库时按冰袋数量给出额定保温时长，改约时据此重算
+    var boxRatedMinutes: Int? = null,        // 出库时保温箱额定保温时长（分钟）
+    var boxSafeUntil: Long? = null,          // 当前保温条件下的安全截止时刻
+    var boxDurationResetAt: Long? = null,    // 最近一次重算保温时长的基准时刻（改约时）
+    var boxRemainingMinutesAtReset: Int? = null, // 重算时刻剩余的保温时长（分钟）
+
     // 签收
     var signOff: SignOff? = null,
 
@@ -177,4 +183,70 @@ data class PrescriptionPhoto(
     val uploadedBy: String,
     val note: String? = null,
     val at: Long
+)
+
+/**
+ * 患者不在家服务记录（Redis: nothome:{orderId}）。
+ * 骑手到达后无人签收时创建，串联：等待时间、电话结果、冷藏代收点、药师意见、
+ * 改约与保温箱时长重算、骑手带回、药师确认退回箱温、退回药店任务。
+ */
+data class NotHomeServiceRecord(
+    val id: String,
+    val orderId: String,
+    val riderId: String,
+    var stage: NotHomeStage,
+
+    // 骑手到达与等待
+    val arrivedAt: Long,                  // 骑手到达时刻
+    var waitedMinutes: Int,               // 门口实际等待时长（分钟）
+    var phoneResult: PhoneResult,         // 致电患者结果
+    var phoneNote: String? = null,
+    var coolPoint: CoolPointAvailability, // 是否可放置冷藏代收点
+    var coolPointNote: String? = null,
+
+    // 药师处置意见
+    var pharmacistOpinion: PharmacistOpinion? = null,
+    var pharmacistId: String? = null,
+    var pharmacistComment: String? = null,
+    var pharmacistDecidedAt: Long? = null,
+    /** 药师决定时是否已超过保温箱安全时限（决定能否改约的依据） */
+    var safeLimitExceededAtDecision: Boolean? = null,
+
+    // 患者改约
+    var rescheduleAgreed: Boolean = false,
+    var rescheduleAgreedAt: Long? = null,
+    var rescheduleEtaMinutes: Int? = null, // 改约后预计再派送在途时长（分钟）
+    var boxRecalc: BoxDurationRecalc? = null,
+    var boxSafeUntilAfterReset: Long? = null,
+    var boxRemainingMinutesAfterReset: Int? = null,
+    var rescheduleNote: String? = null,
+
+    // 骑手带回 + 药师确认退回箱温
+    var bringBackInitiatedAt: Long? = null,
+    var returnedToPharmacyAt: Long? = null,
+    var returnBoxTempC: Double? = null,     // 药师确认的退回箱温
+    var returnTempConfirmedBy: String? = null,
+    var returnTempConfirmedAt: Long? = null,
+    var returnTempComment: String? = null,
+
+    // 改约失败 → 退回药店任务
+    var returnTaskId: String? = null,
+
+    val createdAt: Long,
+    var updatedAt: Long
+)
+
+/** 改约失败 / 药师要求带回时生成的退回药店任务（Redis task:return:{id}） */
+data class ReturnTask(
+    val id: String,
+    val orderId: String,
+    val riderId: String,
+    var status: ReturnTaskStatus,
+    val reason: String,
+    var boxTempC: Double? = null,          // 骑手带回途中/交接时上报的箱温
+    var receivedBy: String? = null,        // 药店接收人
+    var receivedAt: Long? = null,
+    var receiveNote: String? = null,
+    val createdAt: Long,
+    var updatedAt: Long
 )
