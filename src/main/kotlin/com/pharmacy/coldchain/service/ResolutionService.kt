@@ -60,6 +60,11 @@ class ResolutionService(
         val o = orders.require(orderId)
         orderService.requireStatus(o, OrderStatus.AWAITING_RESOLUTION)
 
+        // 核心规则：药品待药师重新判断时不能结案
+        if (o.usability == Usability.PENDING_REJUDGMENT) {
+            throw ConflictException("药品仍待药师重新判断（PENDING_REJUDGMENT），不能进行赔付结案")
+        }
+
         // 药品处置与药师判定必须一致
         if (o.usability == Usability.UNUSABLE_SCRAPPED && req.drugDisposition != DrugDisposition.SCRAPPED) {
             throw BadRequestException("药师已判定药品不可继续使用，处置方式必须为 SCRAPPED（报损）")

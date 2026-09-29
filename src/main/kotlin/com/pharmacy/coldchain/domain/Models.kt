@@ -34,6 +34,10 @@ data class ColdChainOrder(
     var estimatedDeliveryAt: Long? = null,
     var outboundAt: Long? = null,
     var warehouseOperator: String? = null,
+    /** 保温箱安全配送时限（分钟）：出库起算，超过后不能直接二次派送，必须药师重新评估温控 */
+    var safetyLimitMinutes: Long? = null,
+    /** 取药时保温箱可用时长截止时间（改约时会基于剩余时长重新计算） */
+    var boxValidUntil: Long? = null,
 
     // 配送过程
     var riderId: String? = null,
@@ -177,4 +181,68 @@ data class PrescriptionPhoto(
     val uploadedBy: String,
     val note: String? = null,
     val at: Long
+)
+
+/**
+ * 患者不在家服务记录（骑手到达后无人签收时创建，Redis: service-visit:{orderId}）。
+ * 记录等待时间、电话结果、是否可放置冷藏代收点与药师意见。
+ */
+data class ServiceVisit(
+    val id: String,
+    val orderId: String,
+    val riderId: String,
+    val arrivedAt: Long,                 // 骑手到达时间
+    var waitedSeconds: Long = 0,         // 累计等待时长（秒）
+    var callResult: CallResult? = null,  // 电话联系结果
+    var callNote: String? = null,        // 通话备注（呼叫次数、联系人等）
+    /** 骑手是否发现可用的冷藏代收点 */
+    var pickupPointAvailable: Boolean = false,
+    var pickupPointName: String? = null,  // 冷藏代收点名称
+    /** 骑手实测的当前箱温（°C），供药师判断 */
+    var boxTempC: Double? = null,
+    /** 药师处置意见 */
+    var pharmacistOpinion: PharmacistOpinion? = null,
+    var pharmacistId: String? = null,
+    var pharmacistComment: String? = null,
+    var pharmacistAdvisedAt: Long? = null,
+    /** 是否已超过保温箱安全时限 */
+    var safetyLimitExceeded: Boolean = false,
+    var updatedAt: Long
+)
+
+/** 患者改约记录（同意改约签收时创建，Redis: reschedule:{orderId}） */
+data class Reschedule(
+    val id: String,
+    val orderId: String,
+    val requestedBy: String,             // 发起方（患者账号/骑手/客服）
+    val newAppointmentAt: Long,          // 新预约签收时间
+    var status: RescheduleStatus,
+    /** 药师温控重评：改约时点保温箱剩余可用时长（分钟） */
+    var remainingBoxMinutes: Long? = null,
+    /** 改约后重新计算的保温箱可用时长截止时间 */
+    var recalculatedValidUntil: Long? = null,
+    var pharmacistId: String? = null,
+    var pharmacistComment: String? = null,
+    var reviewedAt: Long? = null,
+    var failureReason: String? = null,   // 改约失败原因
+    val createdAt: Long,
+    var updatedAt: Long
+)
+
+/** 改约失败/药师要求退回时生成的退回药店任务（Redis: return-task:{orderId}） */
+data class ReturnTask(
+    val id: String,
+    val orderId: String,
+    val riderId: String,
+    var status: ReturnTaskStatus,
+    val reason: String,
+    /** 药师确认的退回箱温（°C），未确认前骑手不能把药品带回继续派送 */
+    var confirmedBoxTempC: Double? = null,
+    var pharmacistId: String? = null,
+    var pharmacistComment: String? = null,
+    var confirmedAt: Long? = null,
+    var pickedUpAt: Long? = null,        // 骑手开始送回
+    var arrivedAt: Long? = null,         // 到达药店
+    val createdAt: Long,
+    var updatedAt: Long
 )

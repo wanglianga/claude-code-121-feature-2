@@ -66,17 +66,24 @@ class ColdChainFlowTests {
     }
 
     /** 推进到配送中：照片归档 → 处方审核 → 药师复核 → 出库 → 骑手取药 */
-    private fun toDelivering(orderId: String, boxNo: String = "BOX-001", riderId: String = "rider-1") {
+    private fun toDelivering(
+        orderId: String,
+        boxNo: String = "BOX-001",
+        riderId: String = "rider-1",
+        safetyLimitMinutes: Long? = null
+    ) {
         assertThat(post("/api/orders/$orderId/prescription-photos",
             mapOf("url" to "https://img.example.com/rx/$orderId.jpg"), "PHARMACIST", "pharmacist-1").statusCode.value()).isEqualTo(200)
         assertThat(post("/api/orders/$orderId/prescription-review",
             mapOf("approved" to true), "PHARMACIST", "pharmacist-1").statusCode.value()).isEqualTo(200)
         assertThat(post("/api/orders/$orderId/pharmacist-review",
             mapOf("approved" to true), "PHARMACIST", "pharmacist-2").statusCode.value()).isEqualTo(200)
-        assertThat(post("/api/orders/$orderId/outbound", mapOf(
+        val outbound = mutableMapOf(
             "batchNo" to "B20260901", "expiryDate" to "2027-06-30", "boxNo" to boxNo,
             "icePackCount" to 2, "outboundTempC" to 5.0, "etaMinutes" to 45
-        ), "WAREHOUSE", "warehouse-1").statusCode.value()).isEqualTo(200)
+        )
+        safetyLimitMinutes?.let { outbound["safetyLimitMinutes"] = it }
+        assertThat(post("/api/orders/$orderId/outbound", outbound, "WAREHOUSE", "warehouse-1").statusCode.value()).isEqualTo(200)
         trainRider(riderId)
         assertThat(post("/api/orders/$orderId/pickup", null, "RIDER", riderId).statusCode.value()).isEqualTo(200)
     }
@@ -255,6 +262,259 @@ class ColdChainFlowTests {
             mapOf("usable" to true, "comment" to "在途时间短，温度记录正常，可继续配送"), "PHARMACIST", "pharmacist-1")
         assertThat(rej.body!!.get("status").asText()).isEqualTo("DELIVERING")
 
+        assertThat(signOk(orderId).statusCode.value()).isEqualTo(200)
+    }
+
+    @Test
+    fun `患者不在家：服务记录等待电话代收点，药师意见继续配送后签收`() {
+        val orderId = createOrder()
+        toDelivering(orderId)
+
+        // 骑手到达无人签收：等待时间、电话结果、冷藏代收点、实测箱温
+        val arrival = post("/api/orders/$orderId/not-home/arrival", mapOf(
+            "waitedSeconds" to 180,
+            "callResult" to "ANSWERED_AGREED_WAIT",
+            "callNote" to "已拨打 2 次，患者称 10 分钟内到家",
+            "pickupPointAvailable" to true,
+            "pickupPointName" to "小区北门药房冷藏柜",
+            "boxTempC" to 5.2
+        ), "RIDER", "rider-1")
+        assertThat(arrival.statusCode.value()).isEqualTo(200)
+        assertThat(arrival.body!!.get("callResult").asText()).isEqualTo("ANSWERED_AGREED_WAIT")
+        assertThat(arrival.body!!.get("pickupPointName").asText()).isEqualTo("小区北门药房冷藏柜")
+
+        // 等待中继续补充
+        val waiting = post("/api/orders/$orderId/not-home/waiting", mapOf(
+            "waitedSeconds" to 420, "callResult" to "ANSWERED_AGREED_WAIT", "boxTempC" to 5.6
+        ), "RIDER", "rider-1")
+        assertThat(waiting.body!!.get("waitedSeconds").asLong()).isEqualTo(420)
+
+        // 药店视角可查看完整处理进展：安全时限内、剩余时长约 120 分钟
+        val case = get("/api/orders/$orderId/not-home", "PHARMACIST", "pharmacist-1").body!!
+        assertThat(case.get("safetyLimitExceeded").asBoolean()).isFalse()
+        assertThat(case.get("remainingBoxMinutes").asLong()).isBetween(110L, 120L)
+        assertThat(case.get("canRedeliver").asBoolean()).isFalse()
+        val pharmacy = get("/api/orders/$orderId", "CUSTOMER_SERVICE", "cs-1").body!!
+        assertThat(pharmacy.get("notHome").get("visit").get("waitedSeconds").asLong()).isEqualTo(420)
+
+        // 药师意见：温控正常、未超安全时限 → 继续配送
+        val opinion = post("/api/orders/$orderId/not-home/opinion",
+            mapOf("opinion" to "CONTINUE_DELIVERY", "comment" to "箱温正常，等待时间可接受"), "PHARMACIST", "pharmacist-1")
+        assertThat(opinion.body!!.get("pharmacistOpinion").asText()).isEqualTo("CONTINUE_DELIVERY")
+
+        assertThat(signOk(orderId).statusCode.value()).isEqualTo(200)
+    }
+
+    @Test
+    fun `患者改约：重新计算保温箱可用时长，药师温控重评通过后按新时间签收`() {
+        val orderId = createOrder()
+        toDelivering(orderId)
+
+        post("/api/orders/$orderId/not-home/arrival", mapOf(
+            "waitedSeconds" to 300, "callResult" to "ANSWERED_REQUEST_RESCHEDULE",
+            "callNote" to "患者在外地，要求今晚 8 点再送", "boxTempC" to 5.0
+        ), "RIDER", "rider-1")
+
+        // 患者同意改约：服务立即按剩余时长重新计算保温箱可用时长
+        val newAppointmentAt = System.currentTimeMillis() + 30 * 60_000
+        val rs = post("/api/orders/$orderId/reschedule",
+            mapOf("newAppointmentAt" to newAppointmentAt), "PATIENT", "patient-1")
+        assertThat(rs.statusCode.value()).isEqualTo(200)
+        assertThat(rs.body!!.get("status").asText()).isEqualTo("PROPOSED")
+        assertThat(rs.body!!.get("remainingBoxMinutes").asLong()).isBetween(110L, 120L)
+        assertThat(rs.body!!.get("recalculatedValidUntil").asLong()).isGreaterThan(System.currentTimeMillis())
+
+        // 改约通过前订单仍挂起，不能签收
+        assertThat(signOk(orderId).statusCode.value()).isEqualTo(409)
+
+        // 药师温控重评通过
+        val reviewed = post("/api/orders/$orderId/reschedule/review",
+            mapOf("approved" to true, "comment" to "剩余保温时长可覆盖新预约时间"), "PHARMACIST", "pharmacist-1")
+        assertThat(reviewed.body!!.get("status").asText()).isEqualTo("APPROVED")
+
+        val order = get("/api/orders/$orderId", "PHARMACIST", "pharmacist-1").body!!.get("order")
+        assertThat(order.get("status").asText()).isEqualTo("DELIVERING")
+        assertThat(order.get("estimatedDeliveryAt").asLong()).isEqualTo(newAppointmentAt)
+
+        // 患者端可见改约进展
+        val pv = get("/api/patient/orders/$orderId", "PATIENT", "patient-1").body!!
+        assertThat(pv.get("notHome").get("reschedule").get("status").asText()).isEqualTo("APPROVED")
+
+        assertThat(signOk(orderId).statusCode.value()).isEqualTo(200)
+    }
+
+    @Test
+    fun `超过安全时限：禁止直接二次派送，改约温控重评被拒，改约失败生成退回任务`() {
+        val orderId = createOrder()
+        // 安全时限 0 分钟：出库即超时
+        toDelivering(orderId, safetyLimitMinutes = 0)
+
+        val arrival = post("/api/orders/$orderId/not-home/arrival", mapOf(
+            "waitedSeconds" to 60, "callResult" to "NO_ANSWER", "boxTempC" to 6.0
+        ), "RIDER", "rider-1")
+        assertThat(arrival.body!!.get("safetyLimitExceeded").asBoolean()).isTrue()
+
+        val incidents = get("/api/orders/$orderId/incidents", "CUSTOMER_SERVICE", "cs-1").body!!
+        assertThat(incidents.any { it.get("type").asText() == "SAFETY_LIMIT_EXCEEDED" }).isTrue()
+
+        // 超过安全时限后，药师不能直接判可用恢复二次派送
+        val directRej = post("/api/orders/$orderId/rejudgment",
+            mapOf("usable" to true, "comment" to "再跑一趟"), "PHARMACIST", "pharmacist-1")
+        assertThat(directRej.statusCode.value()).isEqualTo(409)
+
+        // 药师“继续配送”意见同样被拦截
+        val continueOpinion = post("/api/orders/$orderId/not-home/opinion",
+            mapOf("opinion" to "CONTINUE_DELIVERY"), "PHARMACIST", "pharmacist-1")
+        assertThat(continueOpinion.statusCode.value()).isEqualTo(409)
+
+        // 可发起改约，但温控重评因已超安全时限不通过
+        post("/api/orders/$orderId/reschedule",
+            mapOf("newAppointmentAt" to System.currentTimeMillis() + 30 * 60_000), "PATIENT", "patient-1")
+        val approve = post("/api/orders/$orderId/reschedule/review",
+            mapOf("approved" to true), "PHARMACIST", "pharmacist-1")
+        assertThat(approve.statusCode.value()).isEqualTo(409)
+        val reject = post("/api/orders/$orderId/reschedule/review",
+            mapOf("approved" to false, "comment" to "保温箱安全时限已过，须退回重新评估"), "PHARMACIST", "pharmacist-1")
+        assertThat(reject.body!!.get("status").asText()).isEqualTo("REJECTED")
+
+        // 改约失败 → 生成退回药店任务
+        val fail = post("/api/orders/$orderId/reschedule/fail",
+            mapOf("reason" to "患者今晚无法返回，联系改日再送失败"), "CUSTOMER_SERVICE", "cs-1")
+        assertThat(fail.statusCode.value()).isEqualTo(200)
+        assertThat(fail.body!!.get("status").asText()).isEqualTo("CREATED")
+        val incidents2 = get("/api/orders/$orderId/incidents", "CUSTOMER_SERVICE", "cs-1").body!!
+        assertThat(incidents2.any { it.get("type").asText() == "RESCHEDULE_FAILED" }).isTrue()
+
+        // 退回任务列表对仓库可见
+        val tasks = get("/api/return-tasks", "WAREHOUSE", "warehouse-1").body!!
+        assertThat(tasks.any { it.get("orderId").asText() == orderId }).isTrue()
+    }
+
+    @Test
+    fun `退回药店：药师确认退回箱温前骑手不能带回，确认后到店报损结案并回收保温箱`() {
+        val orderId = createOrder()
+        toDelivering(orderId, boxNo = "BOX-010")
+
+        post("/api/orders/$orderId/not-home/arrival", mapOf(
+            "waitedSeconds" to 600, "callResult" to "WRONG_PERSON", "boxTempC" to 7.8
+        ), "RIDER", "rider-1")
+
+        // 药师意见：退回药店 → 生成退回任务
+        val opinion = post("/api/orders/$orderId/not-home/opinion",
+            mapOf("opinion" to "RETURN_TO_PHARMACY", "comment" to "无法联系患者，温控余量不足"), "PHARMACIST", "pharmacist-1")
+        assertThat(opinion.statusCode.value()).isEqualTo(200)
+
+        // 药师确认退回箱温前，骑手不能把药品带回
+        val earlyBringBack = post("/api/orders/$orderId/not-home/return/bring-back", null, "RIDER", "rider-1")
+        assertThat(earlyBringBack.statusCode.value()).isEqualTo(409)
+
+        // 药师确认退回箱温
+        val confirm = post("/api/orders/$orderId/not-home/return/confirm-temp",
+            mapOf("boxTempC" to 6.2, "comment" to "开箱复测 6.2°C，同意带回"), "PHARMACIST", "pharmacist-1")
+        assertThat(confirm.body!!.get("status").asText()).isEqualTo("RETURN_CONFIRMED")
+        assertThat(confirm.body!!.get("confirmedBoxTempC").asDouble()).isEqualTo(6.2)
+
+        // 骑手带回（不得继续派送），途中仍可上报箱温
+        val bringBack = post("/api/orders/$orderId/not-home/return/bring-back", null, "RIDER", "rider-1")
+        assertThat(bringBack.body!!.get("status").asText()).isEqualTo("IN_TRANSIT")
+        val orderReturning = get("/api/orders/$orderId", "PHARMACIST", "pharmacist-1").body!!.get("order")
+        assertThat(orderReturning.get("status").asText()).isEqualTo("RETURNING")
+        // 退回途中不能继续派送/签收
+        assertThat(signOk(orderId).statusCode.value()).isEqualTo(409)
+        assertThat(post("/api/orders/$orderId/telemetry",
+            mapOf("tempC" to 6.5), "RIDER", "rider-1").statusCode.value()).isEqualTo(200)
+
+        // 到店 → 待药师重新判断
+        val arrived = post("/api/orders/$orderId/not-home/return/arrive-pharmacy", null, "RIDER", "rider-1")
+        assertThat(arrived.body!!.get("status").asText()).isEqualTo("ARRIVED")
+        val atStore = get("/api/orders/$orderId", "PHARMACIST", "pharmacist-1").body!!.get("order")
+        assertThat(atStore.get("status").asText()).isEqualTo("AWAITING_RESOLUTION")
+
+        // 待重判时不能直接结案
+        val earlyResolve = post("/api/orders/$orderId/resolution",
+            mapOf("drugDisposition" to "SCRAPPED", "refundAmountCents" to 100000), "COMPENSATION", "comp-1")
+        assertThat(earlyResolve.statusCode.value()).isEqualTo(409)
+
+        // 药师判不可用 → 报损结案
+        post("/api/orders/$orderId/rejudgment",
+            mapOf("usable" to false, "comment" to "在途超时，退回后判定不可用"), "PHARMACIST", "pharmacist-1")
+        val resolution = post("/api/orders/$orderId/resolution", mapOf(
+            "drugDisposition" to "SCRAPPED", "reissue" to false, "refundAmountCents" to 100000
+        ), "COMPENSATION", "comp-1")
+        assertThat(resolution.statusCode.value()).isEqualTo(200)
+
+        // 保温箱回收循环
+        val recycled = post("/api/boxes/BOX-010/recycle",
+            mapOf("conditionOk" to true), "WAREHOUSE", "warehouse-1")
+        assertThat(recycled.body!!.get("status").asText()).isEqualTo("READY")
+    }
+
+    @Test
+    fun `二次配送再次无人签收：归档历史服务记录与改约，可再次改约成功`() {
+        val orderId = createOrder()
+        toDelivering(orderId)
+
+        // 第一次不在家 → 改约通过 → 恢复配送
+        post("/api/orders/$orderId/not-home/arrival", mapOf(
+            "waitedSeconds" to 60, "callResult" to "ANSWERED_REQUEST_RESCHEDULE", "boxTempC" to 5.0
+        ), "RIDER", "rider-1")
+        post("/api/orders/$orderId/reschedule",
+            mapOf("newAppointmentAt" to System.currentTimeMillis() + 20 * 60_000), "PATIENT", "patient-1")
+        val review = post("/api/orders/$orderId/reschedule/review",
+            mapOf("approved" to true), "PHARMACIST", "pharmacist-1")
+        assertThat(review.body!!.get("status").asText()).isEqualTo("APPROVED")
+
+        // 二次到达仍无人：旧服务记录/改约归档，重新登记
+        val arrival2 = post("/api/orders/$orderId/not-home/arrival", mapOf(
+            "waitedSeconds" to 90, "callResult" to "ANSWERED_AGREED_WAIT", "boxTempC" to 5.4
+        ), "RIDER", "rider-1")
+        assertThat(arrival2.statusCode.value()).isEqualTo(200)
+        assertThat(arrival2.body!!.get("waitedSeconds").asLong()).isEqualTo(90)
+
+        val case = get("/api/orders/$orderId/not-home", "PHARMACIST", "pharmacist-1").body!!
+        assertThat(case.get("visitHistory").size()).isEqualTo(1)
+        assertThat(case.get("rescheduleHistory").size()).isEqualTo(1)
+        assertThat(case.get("reschedule").isNull).isTrue()
+
+        // 再次改约并温控重评通过 → 签收
+        post("/api/orders/$orderId/reschedule",
+            mapOf("newAppointmentAt" to System.currentTimeMillis() + 40 * 60_000), "PATIENT", "patient-1")
+        val review2 = post("/api/orders/$orderId/reschedule/review",
+            mapOf("approved" to true, "comment" to "剩余时长仍可覆盖"), "PHARMACIST", "pharmacist-1")
+        assertThat(review2.body!!.get("status").asText()).isEqualTo("APPROVED")
+        assertThat(signOk(orderId).statusCode.value()).isEqualTo(200)
+    }
+
+    @Test
+    fun `药师同意冷藏代收点：骑手放置后恢复配送签收`() {
+        val orderId = createOrder()
+        toDelivering(orderId)
+
+        post("/api/orders/$orderId/not-home/arrival", mapOf(
+            "waitedSeconds" to 120, "callResult" to "ANSWERED_AGREED_WAIT",
+            "pickupPointAvailable" to true, "pickupPointName" to "社区医院冷藏代收点", "boxTempC" to 4.8
+        ), "RIDER", "rider-1")
+
+        // 没有药师意见前骑手不能自行放置
+        val early = post("/api/orders/$orderId/not-home/leave-pickup-point", null, "RIDER", "rider-1")
+        assertThat(early.statusCode.value()).isEqualTo(409)
+
+        val opinion = post("/api/orders/$orderId/not-home/opinion",
+            mapOf("opinion" to "LEAVE_AT_PICKUP_POINT", "comment" to "代收点具备冷藏条件，可放置"),
+            "PHARMACIST", "pharmacist-1")
+        assertThat(opinion.body!!.get("pharmacistOpinion").asText()).isEqualTo("LEAVE_AT_PICKUP_POINT")
+
+        // 无代收点记录时药师不能给出放置意见（另一单反例）
+        val orderId2 = createOrder()
+        toDelivering(orderId2, boxNo = "BOX-011")
+        post("/api/orders/$orderId2/not-home/arrival",
+            mapOf("waitedSeconds" to 60, "callResult" to "NO_ANSWER", "pickupPointAvailable" to false), "RIDER", "rider-1")
+        val noPoint = post("/api/orders/$orderId2/not-home/opinion",
+            mapOf("opinion" to "LEAVE_AT_PICKUP_POINT"), "PHARMACIST", "pharmacist-1")
+        assertThat(noPoint.statusCode.value()).isEqualTo(409)
+
+        val left = post("/api/orders/$orderId/not-home/leave-pickup-point", null, "RIDER", "rider-1")
+        assertThat(left.body!!.get("status").asText()).isEqualTo("DELIVERING")
         assertThat(signOk(orderId).statusCode.value()).isEqualTo(200)
     }
 

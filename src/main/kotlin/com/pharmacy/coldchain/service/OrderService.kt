@@ -44,7 +44,8 @@ class OrderService(
     private val store: JsonStore,
     private val incidents: IncidentService,
     private val boxes: BoxService,
-    private val payments: PaymentService
+    private val payments: PaymentService,
+    private val notHome: NotHomeService
 ) {
 
     // ---------- 下单 ----------
@@ -161,6 +162,9 @@ class OrderService(
         if (box.status != BoxStatus.READY) {
             throw ConflictException("保温箱 ${req.boxNo} 当前状态为 ${box.status}，不可用于出库")
         }
+        // safetyLimitMinutes=0 表示该保温箱无安全余量（出库即到时限），一般仅用于异常演示/测试
+        req.safetyLimitMinutes?.let { if (it < 0) throw BadRequestException("保温箱安全时限不能为负（分钟）") }
+        val safetyLimitMinutes = req.safetyLimitMinutes ?: NotHomeService.DEFAULT_SAFETY_LIMIT_MINUTES
         val now = System.currentTimeMillis()
         box.status = BoxStatus.IN_USE
         box.currentOrderId = o.id
@@ -173,6 +177,8 @@ class OrderService(
         o.icePackCount = req.icePackCount
         o.outboundTempC = req.outboundTempC
         o.estimatedDeliveryAt = now + req.etaMinutes * 60_000
+        o.safetyLimitMinutes = safetyLimitMinutes
+        o.boxValidUntil = now + safetyLimitMinutes * 60_000
         o.outboundAt = now
         o.warehouseOperator = operator
         o.status = OrderStatus.OUTBOUND
@@ -186,6 +192,24 @@ class OrderService(
         val o = orders.require(orderId)
         if (o.usability != Usability.PENDING_REJUDGMENT) {
             throw ConflictException("订单 ${o.id} 当前不需要药师重新判断（usability=${o.usability}）")
+        }
+        if (o.status == OrderStatus.RETURNING) {
+            throw ConflictException("药品正在退回药店途中，请在骑手送达药店后再重新判断")
+        }
+        // 患者不在家且超过安全时限：不能直接判可用恢复二次派送，必须改约温控重评或退回
+        if (o.status == OrderStatus.SIGN_FAILED && notHome.getReturnTask(orderId) != null) {
+            throw ConflictException("订单已生成退回药店任务，请在药品退回到店后再重新判断药品可用性")
+        }
+        if (req.usable && o.status == OrderStatus.SIGN_FAILED) {
+            val visit = notHome.getVisit(orderId)
+            val exceeded = visit?.safetyLimitExceeded == true ||
+                o.boxValidUntil?.let { System.currentTimeMillis() > it } == true
+            if (exceeded) {
+                throw ConflictException(
+                    "已超过保温箱安全时限（${o.safetyLimitMinutes} 分钟），订单不能直接二次派送，" +
+                        "请安排患者改约并重新评估温控，或生成退回药店任务"
+                )
+            }
         }
         val rec = Rejudgment(
             id = store.nextId("RJ"),
@@ -205,8 +229,9 @@ class OrderService(
                     o.status = OrderStatus.DELIVERING
                     incidents.resolveAllForOrder(orderId, pharmacist, "药师重新判断：药品可继续使用，恢复配送")
                 }
-                // 退药申请中药品仍可用 → 仍需客服/赔付处理退药诉求
-                OrderStatus.RETURN_REQUESTED -> o.status = OrderStatus.AWAITING_RESOLUTION
+                // 退药申请中/药品退回药店后仍可用 → 仍需客服/赔付做最终处置
+                OrderStatus.RETURN_REQUESTED, OrderStatus.AWAITING_RESOLUTION ->
+                    o.status = OrderStatus.AWAITING_RESOLUTION
                 else -> {}
             }
         } else {
@@ -310,7 +335,8 @@ class OrderService(
             resolution = store.get<Resolution>("resolution:$orderId"),
             payment = payments.get(orderId),
             box = o.boxNo?.let { boxes.find(it) },
-            followUps = store.lrangeJson("followup:$orderId")
+            followUps = store.lrangeJson("followup:$orderId"),
+            notHome = notHome.caseView(orderId)
         )
     }
 
@@ -344,7 +370,8 @@ class OrderService(
             medicationReminders = o.medicationReminders,
             riskReminders = o.riskReminders,
             sign = o.signOff,
-            estimatedDeliveryAt = o.estimatedDeliveryAt
+            estimatedDeliveryAt = o.estimatedDeliveryAt,
+            notHome = notHome.caseView(orderId)
         )
     }
 

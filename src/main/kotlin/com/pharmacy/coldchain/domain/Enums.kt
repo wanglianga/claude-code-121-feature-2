@@ -21,6 +21,7 @@ enum class OrderStatus {
     AWAITING_RESOLUTION,     // 待赔付/客服最终处理
     SIGNED,                  // 已签收
     REISSUED,                // 已补发（生成新订单）
+    RETURNING,               // 药师确认退回箱温后，骑手将药品送回药店中（不得继续派送）
     CLOSED                   // 已结案
 }
 
@@ -40,12 +41,47 @@ enum class IncidentType {
     BOX_OPENED_ABNORMAL,     // 保温箱开盖异常
     PACKAGE_DAMAGED,         // 药品外包装破损
     PATIENT_RETURN_REQUEST,  // 患者申请退药
+    SAFETY_LIMIT_EXCEEDED,   // 患者不在家滞留超过保温箱安全时限，禁止直接二次派送
+    RESCHEDULE_FAILED,       // 患者改约失败（超时/拒绝/联系不上）
     PHARMACIST_UNUSABLE      // 药师判定不可继续使用
 }
 
 enum class IncidentStatus { OPEN, RESOLVED }
 
 enum class ReceiverType { SELF, PROXY }
+
+/** 骑手到达后联系患者的电话结果 */
+enum class CallResult {
+    ANSWERED_AGREED_WAIT,     // 已接通，患者同意稍候
+    ANSWERED_REQUEST_RESCHEDULE, // 已接通，患者要求改约
+    ANSWERED_REFUSED,         // 已接通，患者拒收
+    NO_ANSWER,                // 无人接听
+    WRONG_PERSON              // 非本人/号码有误
+}
+
+/** 患者改约进展 */
+enum class RescheduleStatus {
+    PROPOSED,        // 已发起改约，等待药师温控重评
+    APPROVED,        // 药师重评通过，按新预约时间继续配送
+    REJECTED,        // 药师重评不通过（保温箱安全时限不足/温度异常）
+    FAILED           // 改约失败（患者确认无法签收等），转退回药店
+}
+
+/** 退回药店任务状态 */
+enum class ReturnTaskStatus {
+    CREATED,         // 已生成退回任务，等待药师确认退回箱温
+    RETURN_CONFIRMED,// 药师已确认退回箱温，骑手可以带回
+    IN_TRANSIT,      // 骑手送回药店途中
+    ARRIVED          // 药品已退回药店（保温箱可回收，药品待药师处置）
+}
+
+/** 药师对“患者不在家”服务记录的处置意见 */
+enum class PharmacistOpinion {
+    CONTINUE_DELIVERY,      // 温控正常且未超安全时限，可继续等待/配送
+    LEAVE_AT_PICKUP_POINT,  // 可放置在冷藏代收点
+    RESCHEDULE,             // 建议与患者改约签收
+    RETURN_TO_PHARMACY      // 建议退回药店
+}
 
 /** 最终药品处置方式 */
 enum class DrugDisposition { SCRAPPED, RETURNED_TO_STOCK }

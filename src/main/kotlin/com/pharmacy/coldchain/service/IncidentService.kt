@@ -69,4 +69,11 @@ class IncidentService(private val store: JsonStore) {
             resolve(it.id, resolver, note)
         }
     }
+
+    /** 仅关闭订单上指定类型的未处理事件（其他类型如超温保留给药师/赔付） */
+    fun resolveByTypes(orderId: String, types: Set<IncidentType>, resolver: String, note: String) {
+        byOrder(orderId)
+            .filter { it.status == IncidentStatus.OPEN && it.type in types }
+            .forEach { resolve(it.id, resolver, note) }
+    }
 }
